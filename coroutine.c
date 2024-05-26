@@ -3,26 +3,55 @@
 #include <stdlib.h>
 #include <ucontext.h>
 
-static int switches = 4;
-
 // represents work in flight
 static int in_flight;
 
 static const int batch_size = 4;
 static int total = 0;
 
-static void producer(ucontext_t *self, ucontext_t *target)
+static void producer();
+static void consumer();
+
+static struct
+{
+    void (*f)(void);
+    ucontext_t uc;
+} contexts[] = {
+    {.f = consumer},
+    {.f = producer},
+};
+
+static void yield_to(void (*f)(void))
+{
+    const int NN = sizeof(contexts) / sizeof(contexts[0]);
+    for (int i = 0; i < NN; i++)
+        if (contexts[i].f == f)
+        {
+            // interesting; trying to suspend/restore like this _almost_ works:
+            // static __thread ucontext_t cur;
+            // swapcontext(&cur, &contexts[i].uc);
+            // but, `last` is always 0? i.e., it seems like we're losing track of the
+            // caller's stack.
+
+            // this works, because there's exactly 2.
+            // in general, how can we identify the caller's context?
+            swapcontext(&contexts[1 - i].uc, &contexts[i].uc);
+            return;
+        }
+}
+
+static void producer()
 {
     while (1)
     {
         printf("producing %d", batch_size);
         fflush(stdout);
         in_flight += batch_size;
-        swapcontext(self, target);
+        yield_to(consumer);
     }
 }
 
-static void consumer(ucontext_t *self, ucontext_t *target)
+static void consumer()
 {
     int last;
     while (1)
@@ -38,7 +67,7 @@ static void consumer(ucontext_t *self, ucontext_t *target)
             printf("consumed %d (total: %d)\n", last, total);
             if (total >= 32)
                 return;
-            swapcontext(self, target);
+            yield_to(producer);
             last = in_flight;
         }
     }
@@ -46,28 +75,26 @@ static void consumer(ucontext_t *self, ucontext_t *target)
 
 int main(void)
 {
-    const int m = 2;
-    ucontext_t uc[m + 1];
+    const int m = sizeof(contexts) / sizeof(contexts[0]);
+    struct ucontext_t uc_main;
     char st[m][8192];
 
     // set up tasks
     for (int i = 0; i < m; i++)
     {
-        if (getcontext(&uc[i + 1]) == -1)
+        ucontext_t *ucp = &contexts[i].uc;
+        if (getcontext(ucp) == -1)
             abort();
 
-        uc[i + 1].uc_link = &uc[0]; // main context
-        uc[i + 1].uc_stack.ss_sp = st[i];
-        uc[i + 1].uc_stack.ss_size = sizeof st[i];
+        ucp->uc_link = &uc_main; // main context
+        ucp->uc_stack.ss_sp = st[i];
+        ucp->uc_stack.ss_size = sizeof st[i];
+
+        makecontext(ucp, contexts[i].f, 0);
     }
 
-    // "scheduler"
-    const int argc = 2 * sizeof(ucontext_t *) / sizeof(int);
-    makecontext(&uc[1], (void (*)(void))producer, argc, &uc[1], &uc[2]);
-    makecontext(&uc[2], (void (*)(void))consumer, argc, &uc[2], &uc[1]);
-
     // go
-    swapcontext(&uc[0], &uc[2]);
+    swapcontext(&uc_main, &contexts[0].uc);
 
     // we'll get here after either:
     // - `swapcontext(..., &uc[0])`

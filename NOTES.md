@@ -224,3 +224,85 @@ uc_link: 7ffe6c454a90
 before exiting 255 (i.e. not a segfault). Still, there's at least two kinds of UB going on in that program, so it's probably something that's not really worth chasing down.
 
 Suffice to say, yes: there's a strong ordering dependence on setting up those parameters and the `makecontext` call.
+
+
+## towards n threads
+
+The struggle at this point seems to be crafting an example that:
+
+1) triggers "interesting" swaps (i.e. suspend on one thread, resume on another)
+2) is simple enough to reason about that it doesn't distract from the task at hand
+
+Maybe some sort of batched scatter/gather thing? Like, a bunch of independent tasks are all bumping their local counters, and there's a "gather" that runs through and accumulates them all into a single sum? And when it "runs out", it goes and asks for more (-> kicks off the multiple producers again)?
+
+Yeah, that seems like it could work; that would let us do:
+
+1 main task that spawns M tasks & N threads, and "kicks things off" by triggering the gather task.
+
+1 gather task that just iterates some fixed-size array and accumulates; exiting when we exceed some accumulated total again.
+
+N scatter tasks (to saturate our threads) that each gets a "slot" in the array to increment.
+
+challenges:
+
+* how does the gather task kick off all the scatter tasks (fan out)? We need something like a latch/barrier that parks the underlying pthreads until they're told to go.
+* how do the fan-in from finishing the producer work? another latch means we'd only have N-1 threads available for gathering
+    * hmm, we also probably want a constriction point here to linearize printing, too
+* how do we do scheduling? We want to ensure:
+    * each execution is _deterministic_
+    * at least one time we hop across thread boundaries between a `makecontext` and a `swapcontext`
+    * each thread gets at least some work
+
+### but first, a detour
+
+it feels like it'd be nicer to be able to say `yield_to(fn)` rather than passing around a bunch of pointers to contexts and trying to track the mapping between pointers and functions by hand. Also, it feels a little sketchy to me to be doing this:
+
+
+```c
+static void consumer(ucontext_t *self, ucontext_t *target);
+// ...
+
+const int argc = 2 * sizeof(ucontext_t *) / sizeof(int);
+makecontext(&uc[1], (void (*)(void))producer, argc, &uc[1], &uc[2]);
+```
+
+like, it clearly _works_, but `int` is 1/2 the size of the pointer? so `makecontext` ought to be setting up the call with 4 arguments, but we're only giving it 2? which is ok, I guess, because each of those 2 is 2x the width it should be, but...
+
+Like, it's probably working because `makecontext` and `consumer` happen to share a similar-enough ABI that however the pointers are passed to `makecontext` (i.e. register promotion, stack spilling, whatever) matches how the compiler expects to read them when they're passed to `consumer`. But there's usually a "discontinuity" in ABIs at some argument count (e.g. the "common" RISC-V ABI expects to see the first 8 arguments in registers, then the rest spill into the stack); it seems like it'd be quite possible to pass "too many" arguments to `makecontext` and trigger a difference between how they're `va_arg`s'd...
+
+This isn't just a theoretical concern, either; the fesvr's `context.h` has this snippet:
+
+```cpp
+#ifndef GLIBC_64BIT_PTR_BUG
+  static void wrapper(context_t*);
+#else
+  static void wrapper(unsigned int, unsigned int);
+#endif
+```
+—https://github.com/riscv-software-src/riscv-isa-sim/blob/2cfd5393520c0673fd0182fcca430351d9e6682d/fesvr/context.h#L40-L44
+
+Which sure looks to me like they ran into at least one situation where it _didn't_ "just work." Tracing that back across repos, it looks like that code came from: https://github.com/riscvarchive/riscv-fesvr/pull/15 . Apparently, there's Special Code on Linux in glibc for passing 64-bit pointers this way. So probably e.g. libucontext _wouldn't_ work, nor would picking a different operating system.
+
+On Linux with glibc, though, apparently the Special Code has been part of glibc mainline since version 2.8, which is from ~2008 or so: https://sourceware.org/glibc/wiki/Glibc%20Timeline . So, yeah, that's code that's legally old enough to seek emancipation in any state in the United States, and old enough to legally drink in some parts of Europe. Yikes.
+
+Ok, back onto our main detour from the detour's detour through ways to contextualize how old I'm feeling right now. The thing that'd feel an awful lot clearer and safer would be to implement something like:
+
+```c
+void yield_to(void (*f)(void));
+```
+
+Which we'd have to be careful to set up ahead of time, since we can't just _call_ a function with `makecontext`/`swapcontext`. I mean, we could, but we want the function to name a _task_ which means calling it "from the top" would be some boring stackless coroutine shit and we're not here for that.
+
+Instead, let's make a table for "task identifier" (right now, function; that's gonna get spicy in a minute tho) to "task context" (i.e. `ucontext_t`):
+
+```c
+static struct
+{
+    void (*f)(void);
+    ucontext_t uc;
+} contexts[] = {
+   // ...
+};
+```
+
+then, in `yield_to`, we can scan that table to find the context matching the identifier (function pointer) and invoke it.
