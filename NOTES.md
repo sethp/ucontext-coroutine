@@ -1,12 +1,12 @@
 # Context
 
-This is more of an append-mostly log of the notes I took as I went (vs. README.md). I'm intending to avoid going back and re-editing earlier sections too much as my understanding improves, which may make this journal more useful to you if you've got the same questions & misunderstandings I do. In the event that you're coming to this from a different place than where I happened to be (which seems quite likely, since I haven't noticed you hovering over my shoulder for the last 15 years), it's probably going to read more like a tedious stream-of-conciousness in dire need of some editing. Either way, I'd be grateful to hear your feedback. 
+This is more of an append-mostly log of the notes I took as I went (vs. README.md). I'm intending to avoid going back and re-editing earlier sections too much as my understanding improves, which may make this journal more useful to you if you've got the same questions & misunderstandings I do. In the event that you're coming to this from a different place than where I happened to be (which seems quite likely, since I haven't noticed you hovering over my shoulder for the last 15 years), it's probably going to read more like a tedious stream-of-conciousness in dire need of some editing. Either way, I'd be grateful to hear your feedback.
 
 ## Why
 
-The motivating example for me is trying to understand a crash in a [verilated] model of [a NIC implementation][icenic] which relies on the RISC-V [fesvr] ("front-end server") C++ [`context_t`][context_t] ucontext wrapper for [work handling](https://github.com/firesim/icenet/blob/7c17985a46108c8ff8d424b1b3af6eebc37c38a3/src/main/resources/csrc/SimNetwork.cc#L54-L59) and only occurs when [multithreading](https://verilator.org/guide/latest/verilating.html#multithreading). Conveniently, the crash is both immediate and deterministic for a given verilated model, which makes it an excellent learning opportunity. 
+The motivating example for me is trying to understand a crash in a [verilated] model of [a NIC implementation][icenic] which relies on the RISC-V [fesvr] ("front-end server") C++ [`context_t`][context_t] ucontext wrapper for [work handling](https://github.com/firesim/icenet/blob/7c17985a46108c8ff8d424b1b3af6eebc37c38a3/src/main/resources/csrc/SimNetwork.cc#L54-L59) and only occurs when [multithreading](https://verilator.org/guide/latest/verilating.html#multithreading). Conveniently, the crash is both immediate and deterministic for a given verilated model, which makes it an excellent learning opportunity.
 
-The full description of the crash is here: https://github.com/ucb-bar/chipyard/issues/1885 
+The full description of the crash is here: https://github.com/ucb-bar/chipyard/issues/1885
 
 [verilated]: https://verilator.org/guide/latest/overview.html#overview
 [icenic]: https://github.com/firesim/icenet/blob/7c17985a46108c8ff8d424b1b3af6eebc37c38a3/src/main/resources/csrc/SimNetwork.cc
@@ -18,12 +18,12 @@ If you, like me, want some help unpacking that _whole deal_, then this worked ex
 Specifically, I'm hoping to answer these questions for myself:
 
 * Why does the fesvr's `context_t` use a thread-local? What is it tracking in there?
-* Which implementation choices exist in the problem domain? Which does the `fesvr` express? 
-* Does the fesvr wrapper make sense in a multi-threaded context, or not? 
+* Which implementation choices exist in the problem domain? Which does the `fesvr` express?
+* Does the fesvr wrapper make sense in a multi-threaded context, or not?
 
 ### No, but why ucontext
 
-Why add more ucontext code to the world in 2024, when it's been long-deprecated & was [removed from POSIX](https://stackoverflow.com/a/5541587) in 2008? 
+Why add more ucontext code to the world in 2024, when it's been long-deprecated & was [removed from POSIX](https://stackoverflow.com/a/5541587) in 2008?
 
 Well, besides there being a lot of ucontext code still in the world (over ~20k references [just on github](https://github.com/search?q=%22%3Cucontext.h%3E%22&type=code)), it's still pretty well-supported by lots of operating systems on lots of architectures. Despite being "obsolescent," there's not many alternatives: Boost's [docs](https://www.boost.org/doc/libs/1_85_0/libs/coroutine2/doc/html/coroutine2/coroutine/implementations__fcontext_t__ucontext_t_and_winfiber.html) suggest to me that besides windows-specific WinFiber and writing it yourself (e.g. boost) there's not much in the way of other options. And if you want split stacks (which you probably do for a language runtime that's expecting a _lot_ of contexts), well, apparently that's a ucontext-only deal in Boost-land.
 
@@ -68,7 +68,7 @@ That printed quite a lot of _stuff_ to my terminal, mostly walls of `.` interspe
      return;
 ```
 
-worked as I intended (fewer switches before exit), but trying to print fewer dots before switch I got backwards. 
+worked as I intended (fewer switches before exit), but trying to print fewer dots before switch I got backwards.
 
 ```diff
 -if (++m % 100 == 0)
@@ -91,14 +91,14 @@ That's OK, though, I got there eventually:
 +    printf("\nswitching from %d to %d\n", n, 3 - n);
 +    swapcontext(&uc[n], &uc[3 - n]);
  }
- 
+
  /* Regularly the expire variable must be checked. */
  if (expired)
  {
      /* We do not want the program to run forever. */
      if (++switches == 4)
         return;
- 
+
 -    printf ("\nswitching from %d to %d\n", n, 3 - n);
      expired = 0;
 -    /* Switch to the other context, saving the current one. */
@@ -121,7 +121,7 @@ switching from 2 to 1
 All done, exiting!
 ```
 
-I got curious about what that blank line was doing there, which turned into some fiddling around with the newline character that ended up being an accidentally effective way to understand the control flow and ordering around caller/callee. 
+I got curious about what that blank line was doing there, which turned into some fiddling around with the newline character that ended up being an accidentally effective way to understand the control flow and ordering around caller/callee.
 
 ## reading the (fine) manual
 
@@ -131,9 +131,9 @@ At around this point, too, I read my way through the glibc documentation; it's w
 * it's OK to point to an un-initialized `ucontext_t`, as long as you initialize it (with `swapcontext`) before any of the pointees try to make use of it.
     * this establishes a happens-before relationship that's potentially spicy with multiple threads; maybe that's partially what they mean by `MT-Safe race:ucp`?
     * trying to figure out the threading is gonna be a whole thing, isn't it
-* `setcontext` is more like `goto`; there's no state saved before the outbound edge, and so no way back to the call site. 
+* `setcontext` is more like `goto`; there's no state saved before the outbound edge, and so no way back to the call site.
     * I guess this is kind of related to the `setjmp`/`longjmp` idea where "throwing an exception" means "replace the currently executing context entirely, don't worry about resuming it"; it's not so useful for our purposes though
-* `swapcontext` is maybe more similar to a `call`: but instead of saving the caller address to the stack—which is being replaced—it saves it off to the region pointed to by the `oucp` (original? user context pointer) parameter. 
+* `swapcontext` is maybe more similar to a `call`: but instead of saving the caller address to the stack—which is being replaced—it saves it off to the region pointed to by the `oucp` (original? user context pointer) parameter.
 * Passing function arguments is also a bit strange: they're "side-loaded" ahead of the `swapcontext`/`setcontext` call by setting some structure fields and then calling `makecontext` (see questions below); `makecontext` takes a variable number of arguments, but in kind of an unusual way: it takes an `argc` followed by `argc` "integers". But also, if we get the argc number right, it seems perfectly fine with pointers (which are `long long` on my 64-bit platform), so..... ABIs, amirite?
     * me *through tears*: you can't just pretend everything is an integer
     * c compiler: *points at...... anything* integer
@@ -142,7 +142,7 @@ At around this point, too, I read my way through the glibc documentation; it's w
 *Question*: what happens if the stack parameters are set up in the structure but `makecontext` isn't called? Or if they're changed after the `makecontext` call?
     - i.e. is there any order dependence here? YES (see below).
 
-*Question*: Can we pass a stack parameter by pre-populating the lower addresses of the stack, and then setting the `makecontext` call up to "point" higher up / with a parameter of the "lower" addresses? 
+*Question*: Can we pass a stack parameter by pre-populating the lower addresses of the stack, and then setting the `makecontext` call up to "point" higher up / with a parameter of the "lower" addresses?
     - sure seems like it; and, in fact, that's almost certainly what `makecontext` is doing under the hood
     - see also: https://github.com/kaniini/libucontext/blob/be80075e957c4a61a6415c280802fea9001201a2/arch/riscv64/makecontext.c#L52-L54
 
@@ -204,7 +204,7 @@ Trying to reproduce that failure by setting `uc_link` to an invalid value is a _
  {
      if (getcontext(&uc[i + 1]) == -1)
          abort();
- 
+
 -    uc[i + 1].uc_link = &uc[0];
 +    printf("uc_link: %llx\n", uc[i + 1].uc_link);
 +    uc[i + 1].uc_link = (ucontext_t *)1;
