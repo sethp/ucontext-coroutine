@@ -1,3 +1,5 @@
+# Context
+
 This is more of an append-mostly log of the notes I took as I went (vs. README.md). I'm intending to avoid going back and re-editing earlier sections too much as my understanding improves, which may make this journal more useful to you if you've got the same questions & misunderstandings I do. In the event that you're coming to this from a different place than where I happened to be (which seems quite likely, since I haven't noticed you hovering over my shoulder for the last 15 years), it's probably going to read more like a tedious stream-of-conciousness in dire need of some editing. Either way, I'd be grateful to hear your feedback. 
 
 ## Why
@@ -54,3 +56,171 @@ return [(handle_fn, conn.accept()) for conn in readable]
 (with the idea that the caller will schedule the handle_fn to be called with the rest of the tuple as arguments).
 
 
+# Process
+
+I started with getting the coroutine example from https://www.gnu.org/software/libc/manual/html_node/System-V-contexts.html running: that was as straightforward as copying the example into `coroutine.c` and running `cc coroutine.c -o coroutine && ./coroutine` from my shell. Always nice when the documentation works on the first try.
+
+That printed quite a lot of _stuff_ to my terminal, mostly walls of `.` interspersed with `switching from 1 to 2` or `switching from 2 to 1`. So I fiddled with some of the constants as a way to test my understanding; changing:
+
+```diff
+-if (++switches == 20)
++if (++switches == 4)
+     return;
+```
+
+worked as I intended (fewer switches before exit), but trying to print fewer dots before switch I got backwards. 
+
+```diff
+-if (++m % 100 == 0)
++if (++m % 5 == 0) // oops: prints 20x as often, not 1/20th as often
+ {
+     putchar ('.');
+     fflush (stdout);
+ }
+```
+
+That's OK, though, I got there eventually:
+
+```diff
+ /* This is where the work would be done. */
++putchar('.');
+ if (++m % 5 == 0)
+ {
+-    putchar ('.');
+     fflush (stdout);
++    printf("\nswitching from %d to %d\n", n, 3 - n);
++    swapcontext(&uc[n], &uc[3 - n]);
+ }
+ 
+ /* Regularly the expire variable must be checked. */
+ if (expired)
+ {
+     /* We do not want the program to run forever. */
+     if (++switches == 4)
+        return;
+ 
+-    printf ("\nswitching from %d to %d\n", n, 3 - n);
+     expired = 0;
+-    /* Switch to the other context, saving the current one. */
+-    swapcontext (&uc[n], &uc[3 - n]);
+ }
+```
+
+both allowed removing the timer signal entirely and produced a much more managable output:
+
+```
+.....
+switching from 1 to 2
+.....
+switching from 2 to 1
+.....
+switching from 1 to 2
+.....
+switching from 2 to 1
+
+All done, exiting!
+```
+
+I got curious about what that blank line was doing there, which turned into some fiddling around with the newline character that ended up being an accidentally effective way to understand the control flow and ordering around caller/callee. 
+
+## reading the (fine) manual
+
+At around this point, too, I read my way through the glibc documentation; it's well written and I won't ruin it for you, but I did find futzing with the example a very helpful pre-read. That primed me to understand, for example:
+
+* `makecontext` and `getcontext` are kind of... backwards? Or, at least `getcontext` has to be called _first_ (before `makecontext`) to initialize the ucontext_t
+* it's OK to point to an un-initialized `ucontext_t`, as long as you initialize it (with `swapcontext`) before any of the pointees try to make use of it.
+    * this establishes a happens-before relationship that's potentially spicy with multiple threads; maybe that's partially what they mean by `MT-Safe race:ucp`?
+    * trying to figure out the threading is gonna be a whole thing, isn't it
+* `setcontext` is more like `goto`; there's no state saved before the outbound edge, and so no way back to the call site. 
+    * I guess this is kind of related to the `setjmp`/`longjmp` idea where "throwing an exception" means "replace the currently executing context entirely, don't worry about resuming it"; it's not so useful for our purposes though
+* `swapcontext` is maybe more similar to a `call`: but instead of saving the caller address to the stack—which is being replaced—it saves it off to the region pointed to by the `oucp` (original? user context pointer) parameter. 
+* Passing function arguments is also a bit strange: they're "side-loaded" ahead of the `swapcontext`/`setcontext` call by setting some structure fields and then calling `makecontext` (see questions below); `makecontext` takes a variable number of arguments, but in kind of an unusual way: it takes an `argc` followed by `argc` "integers". But also, if we get the argc number right, it seems perfectly fine with pointers (which are `long long` on my 64-bit platform), so..... ABIs, amirite?
+    * me *through tears*: you can't just pretend everything is an integer
+    * c compiler: *points at...... anything* integer
+
+
+*Question*: what happens if the stack parameters are set up in the structure but `makecontext` isn't called? Or if they're changed after the `makecontext` call?
+    - i.e. is there any order dependence here? YES (see below).
+
+*Question*: Can we pass a stack parameter by pre-populating the lower addresses of the stack, and then setting the `makecontext` call up to "point" higher up / with a parameter of the "lower" addresses? 
+    - sure seems like it; and, in fact, that's almost certainly what `makecontext` is doing under the hood
+    - see also: https://github.com/kaniini/libucontext/blob/be80075e957c4a61a6415c280802fea9001201a2/arch/riscv64/makecontext.c#L52-L54
+
+*Question*: what happens if passing a ucp initialized by `getcontext` in one thread to a `swapcontext` in a different thread?
+    - are "thread locals" (well, the thread-local base) part of the context that gets saved/restored?
+    - NO (not in libucontext, at least): https://github.com/kaniini/libucontext/blob/be80075e957c4a61a6415c280802fea9001201a2/arch/riscv64/getcontext.S#L18
+
+
+## (getting to) setting up the m tasks
+
+So, changing `main` around to use a loop for setup seemed like a good idea; in order to answer the first question above though we need a separate `getcontext` pre-init loop from setting up the structure fields (calling `makecontext` prior to `getcontext` just seems to make the latter hang; attempting to skip `getcontext` enirely segfaults).
+
+### order dependence of `makecontext`
+
+So the structure bits seem to be getting memoized in the `makecontext` call; modifying those after calling `makecontext` doesn't seem to have any effect. Deferring the setup like so:
+
+```c
+    // set up tasks
+    for (int i = 0; i < n; i++)
+    {
+        if (getcontext(&uc[i + 1]) == -1)
+            abort();
+
+        uc[i + 1].uc_stack.ss_size = sizeof st[i];
+        uc[i + 1].uc_stack.ss_sp = st[i];
+    }
+
+    // "scheduler"
+    const int argc = 2 * sizeof(ucontext_t *) / sizeof(int);
+    makecontext(&uc[1], (void (*)(void))producer, argc, &uc[1], &uc[2]);
+    makecontext(&uc[2], (void (*)(void))consumer, argc, &uc[2], &uc[1]);
+
+    for (int i = 0; i < n; i++)
+    {
+        uc[i + 1].uc_link = &uc[0]; // main context
+    }
+````
+
+works fine, just until it comes time to return. Then, we segfault in setcontext approximately when we're trying to return (i.e. when that uc_link would actally be used). We can learn about what triggered the crash:
+
+```
+$ coredumpctl debug
+...
+
+(gdb) display/i $pc
+1: x/i $pc
+=> 0x7f1bb1fd4514 <setcontext+52>:	fldenv (%rcx)
+(gdb) p $rcx
+$1 = 1
+```
+
+`1` seems a little odd (it's a little.... nice, to be garbage), but it's probably not a valid memory address, so yeah that's a crash.
+
+Trying to reproduce that failure by setting `uc_link` to an invalid value is a _little_ tricky; e.g.
+
+```diff
+ // set up tasks
+ for (int i = 0; i < n; i++)
+ {
+     if (getcontext(&uc[i + 1]) == -1)
+         abort();
+ 
+-    uc[i + 1].uc_link = &uc[0];
++    printf("uc_link: %llx\n", uc[i + 1].uc_link);
++    uc[i + 1].uc_link = (ucontext_t *)1;
+     uc[i + 1].uc_stack.ss_size = sizeof st[i];
+     uc[i + 1].uc_stack.ss_sp = st[i];
+ }
+```
+
+prints out something like:
+
+```
+uc_link: 1
+uc_link: 7ffe6c454a90
+...
+```
+
+before exiting 255 (i.e. not a segfault). Still, there's at least two kinds of UB going on in that program, so it's probably something that's not really worth chasing down.
+
+Suffice to say, yes: there's a strong ordering dependence on setting up those parameters and the `makecontext` call.
