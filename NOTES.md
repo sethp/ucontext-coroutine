@@ -306,3 +306,96 @@ static struct
 ```
 
 then, in `yield_to`, we can scan that table to find the context matching the identifier (function pointer) and invoke it.
+
+ah, but a wrinkle:
+
+```c
+static void yield_to(void (*f)(void))
+{
+    const int NN = sizeof(contexts) / sizeof(contexts[0]);
+    for (int i = 0; i < NN; i++)
+        if (contexts[i].f == f)
+        {
+            swapcontext(&contexts[1 - i].uc, &contexts[i].uc);
+            return;
+        }
+}
+```
+
+This works, but only as long as there are exactly 2 user tasks. The trouble is the `oucp` argument (the first, to `swapcontext`): we know what context we want to invoke, but we also have to save our current context in a place where it will be found again.
+
+In other words, consider:
+
+1. in taskA: yield_to(taskB)
+2. in taskB: yield_to(taskA)
+
+It's fairly clear that we'd like taskA to resume from the `yield_to` call, which means we need to `swapcontext(..., &storage_from_yield_to_taskB)`.
+
+Ah, so that's what the other parameter to `swapcontext` is for: it's not enough to invoke the name of the target, you also need to know what other name you'll be called _by_.
+
+So it's not quite right to say:
+
+`yield_to(self, other)`
+
+It's more like:
+
+`yield_to(other's name for me, other)`
+
+What happens if we have multiple call-return sites?
+
+    i.e. (diamond-like pattern)
+    ```
+    task T:
+        if i % 2 == 0:
+            yield L
+        else:
+            yield R
+
+    task L:
+        yield B
+
+    task R:
+        yield B
+
+    task B:
+        yield T
+    ```
+
+    yeah, that works; it _wouldn't_ work to indirect through pointers that changed (i.e. we can't do local renaming)
+
+Perhaps our static scheduling/task definition can save us here?
+
+It's also worth noticing: https://github.com/riscv-software-src/riscv-isa-sim/blob/a53a71fcc3c985cf95973e86e40814c30c551a68/fesvr/context.cc#L81
+
+takes two arguments (both implicit): a thread-local and the `this` pointer.
+
+libucontext's example https://github.com/kaniini/libucontext/blob/be80075e957c4a61a6415c280802fea9001201a2/examples/cooperative_threading.c#L15 also takes two parameters, one implicitly: that's the "last yielded from" param.
+
+It seems like there's an implicit "stack" here that we're subtly ducking by only having two tasks (so there's no possibility of needing to "yield" from three deep).
+
+Perhaps it would be enough to try:
+
+```diff
+ static void yield()
+ {
+-    ucontext_t *next = prev
++    ucontext_t *next = prev, *old_prev = prev;
+     prev = cur;
+     swapcontext(prev, cur = next);
+
++    cur = prev;
++    prev = old_prev;
+ }
+```
+
+That said, in the single producer/consumer pair model we could get away with this:
+
+```diff
+     // go
+-    swapcontext(prev = &uc_main, cur = &contexts[0].uc);
++    prev = &contexts[1].uc;
++    swapcontext(&uc_main, cur = &contexts[0].uc);
+```
+
+and having both `producer` and `consumer` simply `yield()` to each other.
+

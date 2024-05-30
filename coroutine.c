@@ -21,23 +21,29 @@ static struct
     {.f = producer},
 };
 
+ucontext_t uc_main;
+ucontext_t *cur = &uc_main;
+ucontext_t *prev = NULL;
+
 static void yield_to(void (*f)(void))
 {
     const int NN = sizeof(contexts) / sizeof(contexts[0]);
+
+    prev = cur;
     for (int i = 0; i < NN; i++)
         if (contexts[i].f == f)
         {
-            // interesting; trying to suspend/restore like this _almost_ works:
-            // static __thread ucontext_t cur;
-            // swapcontext(&cur, &contexts[i].uc);
-            // but, `last` is always 0? i.e., it seems like we're losing track of the
-            // caller's stack.
-
-            // this works, because there's exactly 2.
-            // in general, how can we identify the caller's context?
-            swapcontext(&contexts[1 - i].uc, &contexts[i].uc);
+            ucontext_t *next = &contexts[i].uc;
+            swapcontext(prev, cur = next);
             return;
         }
+}
+
+static void yield()
+{
+    ucontext_t *next = prev;
+    prev = cur;
+    swapcontext(prev, cur = next);
 }
 
 static void producer()
@@ -47,7 +53,7 @@ static void producer()
         printf("producing %d", batch_size);
         fflush(stdout);
         in_flight += batch_size;
-        yield_to(consumer);
+        yield();
     }
 }
 
@@ -76,7 +82,6 @@ static void consumer()
 int main(void)
 {
     const int m = sizeof(contexts) / sizeof(contexts[0]);
-    struct ucontext_t uc_main;
     char st[m][8192];
 
     // set up tasks
@@ -94,7 +99,7 @@ int main(void)
     }
 
     // go
-    swapcontext(&uc_main, &contexts[0].uc);
+    swapcontext(prev = &uc_main, cur = &contexts[0].uc);
 
     // we'll get here after either:
     // - `swapcontext(..., &uc[0])`
