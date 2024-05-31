@@ -3,22 +3,26 @@
 #include <stdlib.h>
 #include <ucontext.h>
 
+#define N 2
+
 // represents work in flight
-static int in_flight;
+static volatile int in_flight[N];
 
 static const int batch_size = 4;
 static int total = 0;
 
-static void producer();
-static void consumer();
+static void gather();
+static void scatter_all();
+static void scatter(int n);
 
 static struct
 {
     void (*f)(void);
     ucontext_t uc;
 } contexts[] = {
-    {.f = consumer},
-    {.f = producer},
+    {.f = gather},
+    // {.f = scatter},
+    {.f = scatter_all},
 };
 
 ucontext_t uc_main;
@@ -46,43 +50,76 @@ static void yield()
     swapcontext(prev, cur = next);
 }
 
-static void producer()
+static void scatter_all()
+{
+    ucontext_t uc[N];
+    char st[N][4096]; // doesn't want to be < 4096 (yikes)
+
+    for (int i = 0; i < N; i++)
+    {
+        ucontext_t *ucp = &uc[i];
+        if (getcontext(ucp) == -1)
+            abort();
+
+        ucp->uc_link = cur; // should maybe be an errexit of some kind (?)
+        ucp->uc_stack.ss_sp = st[i];
+        ucp->uc_stack.ss_size = sizeof st[i];
+
+        makecontext(ucp, (void (*)(void))scatter, 1, i);
+    }
+
+    ucontext_t *scatter_uc = cur;
+
+    printf("scatter_all: init done\n");
+    while (1)
+    {
+        for (int i = 0; i < N; i++)
+        {
+            prev = scatter_uc;
+            swapcontext(prev, cur = &uc[i]);
+        }
+
+        yield_to(gather);
+    }
+}
+
+static void scatter(int n)
 {
     while (1)
     {
-        printf("producing %d", batch_size);
+        printf("(id=%d) producing %d\n", n, batch_size);
         fflush(stdout);
-        in_flight += batch_size;
+        in_flight[n] += batch_size;
         yield();
     }
 }
 
-static void consumer()
+static void gather()
 {
-    int last;
     while (1)
     {
-        if (in_flight > 0)
+        int got = 0;
+        for (int i = 0; i < N; i++)
         {
-            putchar('.');
-            in_flight--;
-            total++;
+            // CONSUME
+            got += in_flight[i];
+            in_flight[i] = 0;
         }
-        else
-        {
-            printf("consumed %d (total: %d)\n", last, total);
-            if (total >= 32)
-                return;
-            yield_to(producer);
-            last = in_flight;
-        }
+
+        total += got;
+        printf("accumulating... got %d (total: %d)\n", got, total);
+        if (total >= 32 * N)
+            return;
+        yield_to(scatter_all);
     }
 }
 
 int main(void)
 {
     const int m = sizeof(contexts) / sizeof(contexts[0]);
-    char st[m][8192];
+
+    // TODO[seth]: oops, we ran out of stack space, and all we got was a segfault.
+    char st[m][8192 * (N + 1)];
 
     // set up tasks
     for (int i = 0; i < m; i++)
