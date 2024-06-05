@@ -3,44 +3,35 @@
 #include <stdlib.h>
 #include <ucontext.h>
 
+// We have N "scatter" tasks that each produce units of work,
+// and a single "gather" task that processes those work items.
 #define N 2
+static volatile int in_flight[N]; //< represents work in flight
+static const int batch_size = 8;  //< how many units are produced per task
+static int total = 0;             //< an accumulator that tracks processed work
 
-// represents work in flight
-static volatile int in_flight[N];
+typedef struct
+{
+    ucontext_t uc;
+} task_t;
 
-static const int batch_size = 4;
-static int total = 0;
-
+// These are the task entry points
 static void gather();
 static void scatter_all();
 static void scatter(int n);
 
-static struct
-{
-    void (*f)(void);
-    ucontext_t uc;
-} contexts[] = {
-    {.f = gather},
-    // {.f = scatter},
-    {.f = scatter_all},
-};
+static task_t gather_task;
+static task_t scatter_all_task;
 
-ucontext_t uc_main;
-ucontext_t *cur = &uc_main;
+task_t main_task;
+
+ucontext_t *cur = &main_task.uc;
 ucontext_t *prev = NULL;
 
-static void yield_to(void (*f)(void))
+static void yield_to(task_t *task)
 {
-    const int NN = sizeof(contexts) / sizeof(contexts[0]);
-
     prev = cur;
-    for (int i = 0; i < NN; i++)
-        if (contexts[i].f == f)
-        {
-            ucontext_t *next = &contexts[i].uc;
-            swapcontext(prev, cur = next);
-            return;
-        }
+    swapcontext(prev, cur = &task->uc);
 }
 
 static void yield()
@@ -52,12 +43,12 @@ static void yield()
 
 static void scatter_all()
 {
-    ucontext_t uc[N];
+    task_t scatter_tasks[N];
     char st[N][4096]; // doesn't want to be < 4096 (yikes)
 
     for (int i = 0; i < N; i++)
     {
-        ucontext_t *ucp = &uc[i];
+        ucontext_t *ucp = &scatter_tasks[i].uc;
         if (getcontext(ucp) == -1)
             abort();
 
@@ -68,18 +59,15 @@ static void scatter_all()
         makecontext(ucp, (void (*)(void))scatter, 1, i);
     }
 
-    ucontext_t *scatter_uc = cur;
-
     printf("scatter_all: init done\n");
     while (1)
     {
         for (int i = 0; i < N; i++)
         {
-            prev = scatter_uc;
-            swapcontext(prev, cur = &uc[i]);
+            yield_to(&scatter_tasks[i]);
         }
 
-        yield_to(gather);
+        yield_to(&gather_task);
     }
 }
 
@@ -110,36 +98,53 @@ static void gather()
         printf("accumulating... got %d (total: %d)\n", got, total);
         if (total >= 32 * N)
             return;
-        yield_to(scatter_all);
+        yield_to(&scatter_all_task);
     }
 }
 
 int main(void)
 {
-    const int m = sizeof(contexts) / sizeof(contexts[0]);
+    const int m = 2 + N;
 
     // TODO[seth]: oops, we ran out of stack space, and all we got was a segfault.
-    char st[m][8192 * (N + 1)];
+    char st[m][8192 * (N + 1)]; // allocate heterogeneous stacks?
 
-    // set up tasks
-    for (int i = 0; i < m; i++)
+    struct
     {
-        ucontext_t *ucp = &contexts[i].uc;
+        task_t *t;
+        void (*f)(void);
+    } tasks[] = {
+        {
+            .t = &gather_task,
+            .f = gather,
+        },
+        {
+            .t = &scatter_all_task,
+            .f = scatter_all,
+        },
+    };
+
+    const int NT = sizeof(tasks) / sizeof(tasks[0]);
+    // set up tasks
+    for (int i = 0; i < NT; i++)
+    {
+        ucontext_t *ucp = &(tasks[i].t->uc);
         if (getcontext(ucp) == -1)
             abort();
 
-        ucp->uc_link = &uc_main; // main context
+        ucp->uc_link = &main_task.uc; // main context
         ucp->uc_stack.ss_sp = st[i];
         ucp->uc_stack.ss_size = sizeof st[i];
 
-        makecontext(ucp, contexts[i].f, 0);
+        makecontext(ucp, tasks[i].f, 0);
     }
 
     // go
-    swapcontext(prev = &uc_main, cur = &contexts[0].uc);
+    // swapcontext(prev = &main_task.uc, cur = &gather_task.uc);
+    yield_to(&gather_task);
 
     // we'll get here after either:
-    // - `swapcontext(..., &uc[0])`
+    // - `swapcontext(..., &main_task.uc)`
     // - either of the `uc_link`'d functions returns
     printf("All done, exiting!\n");
 

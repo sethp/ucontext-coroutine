@@ -399,3 +399,23 @@ That said, in the single producer/consumer pair model we could get away with thi
 
 and having both `producer` and `consumer` simply `yield()` to each other.
 
+### having created that model, we must immediately break it
+
+the problem with using functions to name work is that
+
+1. it only makes sense once, on entry, and after that it's confusing
+2. it means we can't make copies of a single function
+
+so, instead, it's time for a `task_t`; statically, we still get the possibility of naming tasks as variables, but with a slightly bettter "handle."
+
+For now, it seems all we need to do is just wrap the `ucontext`:
+
+```c
+typedef struct
+{
+    ucontext_t uc;
+} task_t;
+```
+
+But, soon, we'll make use of that to store some task-local state.
+
