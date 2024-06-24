@@ -419,3 +419,48 @@ typedef struct
 
 But, soon, we'll make use of that to store some task-local state.
 
+### threading global task state
+
+At this point, all the task state used by the runtime lives in a pair of globals:
+
+```
+ucontext_t *cur = &main_task.uc;
+ucontext_t *prev = NULL;
+```
+
+When we move to N threads, that will no longer suffice:
+
+1. There will be N "current" tasks
+2. Similarly, there will be multiple antecedents, and a single global "prev" is no longer well defined; as written, it's approximately the most-recently-swapped-from in some total order, which is probably not desirable.
+
+Let's handle these in reverse order.
+
+### threading task state: removing `prev` global
+
+A definition of "previous task" that seems more immediately useful is to define it as "the antecedent to my thread's current task", which also happens to match the semantics we've had up until this point.
+
+That would suggest something more like:
+
+```
+_Thread_local ucontext_t *prev = NULL;
+```
+
+However, that requires some sort of temporally-based reasoning: if the antecedent is bound through a thread-local storage, then any task which attempts to reference its own antecedent (i.e. what the `target` pointer(s) are doing way back in the original chipyard example) will realize a race condition when moved between threads.
+
+Instead, if we move the `prev` pointer to a field on the task struct:
+
+```c
+typedef struct task_t task_t;
+struct task_t
+{
+    ucontext_t uc;
+    task_t *prev;
+};
+```
+
+Now, we've got a place for each of the N "current" tasks to store their antecedent state that's independent of whichever thread happened to run them last. We can safely capture that `prev` pointer, and as long as the antecedent nominal task stays the same (i.e. we're always invoked while a potentially thread-local `cur` points to the same referent as `prev`).
+
+One downside: if we try to invoke the same `task_t` in parallel across multiple threads, we do end up with a write-write race conflict on the `prev` field there (similar to the race condition if a task references its own antecedent).
+
+In other words, we can't write a program that (serialized) sets up some `ucontext_t` and fires it off in parallel across M threads. That's _maybe_ useful, but since each `ucontext_t` embeds its own stack (the `swapcontext` call is basically just stack spilling callee save registers and swapping the stack pointers) we'd almost certainly end up with some sort of race condition on the stack if we tried that anyway. To succeed, such a program must not call any functions (whose return addresses will be written to the stack) or allocate any stack-local variables (instead using only `_Thread_local`s).
+

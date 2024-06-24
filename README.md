@@ -13,9 +13,15 @@ Problem statement:
 Unpacking that a bit:
 
 * M:N (scheduling): Running M concurrent user tasks across N parallel executors (i.e. OS threads).
-* Statically-scheduled: Each task and its mapping to the underlying executor is defined at build time.  
-* Stackful coroutine: a stackful coroutine supports pausing & resuming a user task from arbitrary call depths. This is in contrast to a _stackless_ coroutine, which is much simpler to reason about and implement because it can only suspend/resume from the top level, but can't express e.g. recursion. Compare: Go's goroutines (stackful) vs. Javascript's `setTimeout` (stackless). 
+* Statically-scheduled: Each task and its mapping to the underlying executor is defined at build time.
+* Stackful coroutine: a stackful coroutine supports pausing & resuming a user task from arbitrary call depths. This is in contrast to a _stackless_ coroutine, which is much simpler to reason about and implement because it can only suspend/resume from the top level, but can't express e.g. recursion. Compare: Go's goroutines (stackful) vs. Javascript's `setTimeout` (stackless).
 * Cooperative multi-tasking: our tasks must explicitly yield to each other, there's no out-of-band process that will pre-empt a running piece of work. In other words, every context switch is _explicit_, and every task must have some idea of who to switch _to_.
+
+## Status
+
+The current implementation is M:1, but we've hit our goals otherwise.
+
+Moving to an M:N model would only require spinning up threads and building the locking/parking mechanisms necessary for each of the `scatter`s to wait behind a barrier until kicked off by `scatter_all`, which then in turn waits for them before yielding back to `gather`.
 
 ## Building & Running the Example
 
@@ -39,11 +45,15 @@ producing 4....consumed 4 (total: 32)
 All done, exiting!
 ```
 
-That output indicates successful multiplexing of our m tasks across n threads (for n=1). 
+That output indicates successful multiplexing of our m tasks across n threads (for n=1).
 
 Suggestions:
 
 * Try tracing the control flow through `swapcontext` calls, and across the state set by `makecontext`. How would you identify all possible paths that lead to execution continuing after a `swapcontext` call?
 * Why do you think `getcontext` is required before a call to `makecontext`?
 * What distinguishes a `getcontext`/`setcontext` pair from `makecontext`/`swapcontext`?
-* How is `getcontext`/`setcontext` different from `sigsetjmp`/`siglongjmp`? 
+* How is `getcontext`/`setcontext` different from `sigsetjmp`/`siglongjmp`?
+
+Also, as an open question:
+
+* Is it possible to implement "tail recursion" (i.e. a function that replaces itself on the stack rather than appends to it) using `swapcontext`?

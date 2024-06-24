@@ -10,10 +10,12 @@ static volatile int in_flight[N]; //< represents work in flight
 static const int batch_size = 8;  //< how many units are produced per task
 static int total = 0;             //< an accumulator that tracks processed work
 
-typedef struct
+typedef struct task_t task_t;
+struct task_t
 {
     ucontext_t uc;
-} task_t;
+    task_t *prev;
+};
 
 // These are the task entry points
 static void gather();
@@ -25,20 +27,23 @@ static task_t scatter_all_task;
 
 task_t main_task;
 
-ucontext_t *cur = &main_task.uc;
-ucontext_t *prev = NULL;
+task_t *cur = &main_task;
 
 static void yield_to(task_t *task)
 {
-    prev = cur;
-    swapcontext(prev, cur = &task->uc);
+    task->prev = cur;
+    swapcontext(&task->prev->uc, &(cur = task)->uc);
 }
 
 static void yield()
 {
-    ucontext_t *next = prev;
-    prev = cur;
-    swapcontext(prev, cur = next);
+    task_t *next = cur->prev;
+    // EITHER:
+    // next->prev = cur; // task antecedent is always the most-recently running task
+    // OR:
+    task_t *prev = cur; // task "stack" where `yeild` dereferences last "invoker"
+
+    swapcontext(&prev->uc, &(cur = next)->uc);
 }
 
 static void scatter_all()
@@ -52,7 +57,7 @@ static void scatter_all()
         if (getcontext(ucp) == -1)
             abort();
 
-        ucp->uc_link = cur; // should maybe be an errexit of some kind (?)
+        ucp->uc_link = &cur->uc; // should maybe be an errexit of some kind (?)
         ucp->uc_stack.ss_sp = st[i];
         ucp->uc_stack.ss_size = sizeof st[i];
 
@@ -67,7 +72,7 @@ static void scatter_all()
             yield_to(&scatter_tasks[i]);
         }
 
-        yield_to(&gather_task);
+        yield();
     }
 }
 
